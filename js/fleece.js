@@ -702,22 +702,29 @@ class FleeceDecoder {
         if (this.buffer.length < 2) return null;
         let pos = this.buffer.length - 2;
 
-        const root1 = new FleeceValue(this.buffer, pos, this.view, false);
-
         let p = pos;
         let b0 = this.buffer[p];
+
+        // Root is always a Narrow Pointer (or immediate value, though typically pointer)
+        // If it is a pointer:
         if ((b0 & 0x80) !== 0) {
             let b1 = this.buffer[p+1];
             let o = ((b0 & 0x7F) << 8) | b1;
             p = p - o * 2;
 
-            b0 = this.buffer[p];
-            if ((b0 & 0x80) !== 0) {
-                 let b1 = this.buffer[p+1];
-                 let b2 = this.buffer[p+2];
-                 let b3 = this.buffer[p+3];
-                 let oWide = ((b0 & 0x7F) << 24) | (b1 << 16) | (b2 << 8) | b3;
-                 p = p - oWide * 2;
+            // Check if target is a pointer (Wide Pointer / Trampoline)
+            // Note: Normal Values (Dict, Array, etc) have tags < 8, so MSB (bit 7) is 0.
+            // Pointers have MSB 1.
+            if (p < this.buffer.length) {
+                 b0 = this.buffer[p];
+                 if ((b0 & 0x80) !== 0) {
+                     // It is a pointer. In the context of a Root Slot target, it must be Wide.
+                     let b1 = this.buffer[p+1];
+                     let b2 = this.buffer[p+2];
+                     let b3 = this.buffer[p+3];
+                     let oWide = ((b0 & 0x7F) << 24) | (b1 << 16) | (b2 << 8) | b3;
+                     p = p - oWide * 2;
+                 }
             }
         }
 
