@@ -1,6 +1,20 @@
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
+function readVarInt(buffer, pos) {
+    let result = 0;
+    let shift = 0;
+    let length = 0;
+    while (true) {
+        const b = buffer[pos + length];
+        length++;
+        result |= (b & 0x7F) << shift;
+        if ((b & 0x80) === 0) break;
+        shift += 7;
+    }
+    return { value: result, length };
+}
+
 class FleeceEncoder {
     constructor() {
         this.buffer = new Uint8Array(1024);
@@ -47,15 +61,54 @@ class FleeceEncoder {
         this.stringTable.clear();
         this.buffer = new Uint8Array(1024);
 
-        const rootSlot = this.writeValue(value);
+        const rootInfo = this.writeValue(value); // Returns { type, target/data }
 
-        // Ensure root slot is 2-byte aligned relative to the start of buffer.
-        // Since we are appending it, we must ensure `pos` is even.
+        // Root slot handling:
+        // The file must end with a 2-byte slot pointing to the root.
+        // If root is too far (> 64KB), we need an intermediate wide pointer.
+
         this.pad();
+        const rootSlotPos = this.pos;
 
-        // Finalize the root slot at the current position
-        const finalized = this.finalizeSlot(rootSlot, this.pos);
-        this.writeBytes(finalized);
+        // Calculate offset to root
+        let offset = 0;
+        let needsWide = false;
+
+        if (rootInfo.type === 'pointer') {
+            offset = rootSlotPos - rootInfo.target;
+            if (offset > 65534) {
+                 needsWide = true;
+            }
+        }
+
+        if (needsWide) {
+            // Write a Wide Pointer to the root.
+            // 4 bytes.
+            const offsetBytes = rootSlotPos - rootInfo.target;
+            const o = offsetBytes / 2;
+            // 31-bit offset. Big Endian.
+            // 1ooooooo oooooooo oooooooo oooooooo
+            const b0 = 0x80 | ((o >> 24) & 0x7F);
+            const b1 = (o >> 16) & 0xFF;
+            const b2 = (o >> 8) & 0xFF;
+            const b3 = o & 0xFF;
+            this.writeBytes(new Uint8Array([b0, b1, b2, b3]));
+
+            // Now write a Narrow Pointer to this Wide Pointer.
+            // The Wide Pointer is at `rootSlotPos`.
+            // We are now at `rootSlotPos + 4`.
+            // Offset is 4 bytes.
+            // 4 / 2 = 2 units.
+            // Narrow pointer to -2 units.
+            // 0x8002 ? No.
+            // b0 = 0x80 | ((2 >> 8) & 0x7F) = 0x80.
+            // b1 = 2.
+            this.writeBytes(new Uint8Array([0x80, 0x02]));
+        } else {
+             // Standard narrow slot
+             const finalized = this.finalizeSlot(rootInfo, rootSlotPos, false);
+             this.writeBytes(finalized);
+        }
 
         return this.buffer.slice(0, this.pos);
     }
@@ -73,7 +126,6 @@ class FleeceEncoder {
                     const val = value & 0xFFF;
                     const high = (val >> 8) & 0x0F;
                     const low = val & 0xFF;
-                    // Tag 0. Byte 0 = high. Byte 1 = low.
                     return { type: 'immediate', data: new Uint8Array([high, low]) };
                 } else {
                     // Long Int
@@ -99,7 +151,7 @@ class FleeceEncoder {
                     return { type: 'pointer', target: offset };
                 }
             } else {
-                // Float (Double)
+                // Float
                 this.pad();
                 const offset = this.pos;
                 this.writeByte(0x28);
@@ -112,7 +164,13 @@ class FleeceEncoder {
             }
         } else if (typeof value === 'string') {
             if (this.stringTable.has(value)) {
-                return { type: 'pointer', target: this.stringTable.get(value) };
+                 // Check if existing offset is reachable for a narrow pointer.
+                 // We don't know the future slot position yet.
+                 // But typically string reuse is fine.
+                 // If it's too far, we might need to duplicate it?
+                 // For now, let's just return the pointer.
+                 // If the collection becomes Wide, it handles 32-bit offsets, which covers 4GB.
+                 return { type: 'pointer', target: this.stringTable.get(value) };
             }
             this.pad();
             const offset = this.pos;
@@ -144,24 +202,57 @@ class FleeceEncoder {
                 varintCount = true;
             }
 
+            // Check if Wide
+            let wide = false;
+            // A collection must be wide if any slot needs an offset > 65534 bytes.
+            // Or if explicit wide flag is requested (not implemented).
+            // Since we don't know the exact slot positions yet (they follow header/varint),
+            // we estimate.
+            // Current pos is `offset`. Header is 2 bytes + varint.
+            // Slots start at `offset + 2 + varintLen`.
+            let slotsStart = offset + 2;
+            if (varintCount) {
+                 // Calculate varint length
+                 let n = count;
+                 while (n >= 0x80) { slotsStart++; n >>= 7; }
+                 slotsStart++;
+            }
+
+            // Iterate slots to check offsets
+            let tempPos = slotsStart;
+            for (const slot of slots) {
+                if (slot.type === 'pointer') {
+                     const off = tempPos - slot.target;
+                     if (off > 65534) {
+                         wide = true;
+                         break;
+                     }
+                }
+                tempPos += 2; // Check assuming narrow. If wide, offsets increase, but we check conservatively?
+                // Actually if we switch to wide, slots are 4 bytes. Offsets become larger.
+                // But Wide supports 4GB. So if it doesn't fit in Narrow, it fits in Wide.
+            }
+
             const high3 = (ccc >> 8) & 0x07;
             const low8 = ccc & 0xFF;
 
-            this.writeByte(0x60 | high3);
+            // Array Tag: 0110 w ccc
+            // w is bit 3 of first byte.
+            const wBit = wide ? 0x08 : 0x00;
+            this.writeByte(0x60 | wBit | high3);
             this.writeByte(low8);
 
             if (varintCount) {
                 this.writeVarInt(count);
             }
 
-            // We need to write the slots. Each slot is 2 bytes.
-            // But pointers in slots are relative to the position of the slot!
-            // The slots start at current `this.pos`.
             let currentSlotPos = this.pos;
+            const slotStep = wide ? 4 : 2;
+
             for (const slot of slots) {
-                const finalized = this.finalizeSlot(slot, currentSlotPos);
+                const finalized = this.finalizeSlot(slot, currentSlotPos, wide);
                 this.writeBytes(finalized);
-                currentSlotPos += 2;
+                currentSlotPos += slotStep;
             }
 
             return { type: 'pointer', target: offset };
@@ -169,9 +260,7 @@ class FleeceEncoder {
         } else if (typeof value === 'object') {
             const keys = Object.keys(value).sort();
 
-            // Keys are strings.
             const keySlots = keys.map(k => this.writeValue(k));
-            // Values
             const valSlots = keys.map(k => this.writeValue(value[k]));
 
             this.pad();
@@ -185,10 +274,34 @@ class FleeceEncoder {
                 varintCount = true;
             }
 
+            // Check if Wide
+            let wide = false;
+            let slotsStart = offset + 2;
+            if (varintCount) {
+                 let n = count;
+                 while (n >= 0x80) { slotsStart++; n >>= 7; }
+                 slotsStart++;
+            }
+
+            let tempPos = slotsStart;
+            for (let i = 0; i < count; i++) {
+                // Key
+                if (keySlots[i].type === 'pointer') {
+                    if (tempPos - keySlots[i].target > 65534) { wide = true; break; }
+                }
+                tempPos += 2;
+                // Val
+                if (valSlots[i].type === 'pointer') {
+                    if (tempPos - valSlots[i].target > 65534) { wide = true; break; }
+                }
+                tempPos += 2;
+            }
+
             const high3 = (ccc >> 8) & 0x07;
             const low8 = ccc & 0xFF;
+            const wBit = wide ? 0x08 : 0x00;
 
-            this.writeByte(0x70 | high3);
+            this.writeByte(0x70 | wBit | high3);
             this.writeByte(low8);
 
             if (varintCount) {
@@ -196,14 +309,16 @@ class FleeceEncoder {
             }
 
             let currentSlotPos = this.pos;
-            for (let i = 0; i < count; i++) {
-                const keyFinalized = this.finalizeSlot(keySlots[i], currentSlotPos);
-                this.writeBytes(keyFinalized);
-                currentSlotPos += 2;
+            const slotStep = wide ? 4 : 2;
 
-                const valFinalized = this.finalizeSlot(valSlots[i], currentSlotPos);
+            for (let i = 0; i < count; i++) {
+                const keyFinalized = this.finalizeSlot(keySlots[i], currentSlotPos, wide);
+                this.writeBytes(keyFinalized);
+                currentSlotPos += slotStep;
+
+                const valFinalized = this.finalizeSlot(valSlots[i], currentSlotPos, wide);
                 this.writeBytes(valFinalized);
-                currentSlotPos += 2;
+                currentSlotPos += slotStep;
             }
 
             return { type: 'pointer', target: offset };
@@ -212,16 +327,345 @@ class FleeceEncoder {
         throw new Error("Unsupported type: " + typeof value);
     }
 
-    finalizeSlot(slot, writePos) {
-        if (slot.type === 'immediate') {
-            return slot.data;
+    finalizeSlot(slot, writePos, wide) {
+        if (!wide) {
+            // Narrow Slot (2 bytes)
+            if (slot.type === 'immediate') {
+                return slot.data;
+            } else {
+                const offsetBytes = writePos - slot.target;
+                const offsetUnits = offsetBytes / 2;
+                const o = offsetUnits;
+                const b0 = 0x80 | ((o >> 8) & 0x7F);
+                const b1 = o & 0xFF;
+                return new Uint8Array([b0, b1]);
+            }
         } else {
-            const offsetBytes = writePos - slot.target;
-            const offsetUnits = offsetBytes / 2;
-            const o = offsetUnits;
-            const b0 = 0x80 | ((o >> 8) & 0x7F);
-            const b1 = o & 0xFF;
-            return new Uint8Array([b0, b1]);
+            // Wide Slot (4 bytes)
+            if (slot.type === 'immediate') {
+                // Write 2 bytes data, then 00 00?
+                // Spec says: "3- or 4-byte values use less space in a wide collection since they can be inlined."
+                // But Small Int is 2 bytes.
+                // We'll write the 2 bytes of immediate data, then 2 bytes of padding?
+                // Or padding then data?
+                // "Values are always 2-byte aligned".
+                // If we put 2 bytes at writePos. Then 2 bytes 0.
+                // The next value is at writePos+4. Aligned.
+                const data = new Uint8Array(4);
+                data.set(slot.data, 0); // Copy 2 bytes
+                // data[2], data[3] are 0.
+                return data;
+            } else {
+                // Wide Pointer
+                const offsetBytes = writePos - slot.target;
+                const offsetUnits = offsetBytes / 2;
+                const o = offsetUnits;
+                // 31-bit offset.
+                // 1ooooooo oooooooo oooooooo oooooooo
+                const b0 = 0x80 | ((o >> 24) & 0x7F);
+                const b1 = (o >> 16) & 0xFF;
+                const b2 = (o >> 8) & 0xFF;
+                const b3 = o & 0xFF;
+                return new Uint8Array([b0, b1, b2, b3]);
+            }
+        }
+    }
+}
+
+class FleeceValue {
+    constructor(buffer, pos, view, wide) {
+        this.buffer = buffer;
+        this.view = view || new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+        this.pos = pos;
+        this.wide = wide || false;
+        this._resolvePointer();
+    }
+
+    _resolvePointer() {
+        let loopCount = 0;
+        while (true) {
+            if (loopCount++ > 100) throw new Error("Pointer cycle detected or too deep");
+            if (this.pos >= this.buffer.length) return;
+
+            const b0 = this.buffer[this.pos];
+            // Pointer check
+            // If wide context, 4 bytes.
+            // If narrow context, 2 bytes.
+            // Both have MSB set.
+
+            if ((b0 & 0x80) !== 0) {
+                 let offsetBytes = 0;
+                 if (this.wide) {
+                     // Wide pointer: 4 bytes
+                     const b1 = this.buffer[this.pos + 1];
+                     const b2 = this.buffer[this.pos + 2];
+                     const b3 = this.buffer[this.pos + 3];
+
+                     const o = ((b0 & 0x7F) << 24) | (b1 << 16) | (b2 << 8) | b3;
+                     offsetBytes = o * 2;
+
+                     // Target of pointer is NOT in wide context (unless it's another wide collection slot, which it isn't usually).
+                     // Pointer points to a Value.
+                     // The Value is self-contained.
+                     // So we switch wide=false for the next iteration (unless we are just resolving indirection).
+
+                 } else {
+                     // Narrow pointer: 2 bytes
+                     const b1 = this.buffer[this.pos + 1];
+                     const o = ((b0 & 0x7F) << 8) | b1;
+                     offsetBytes = o * 2;
+                 }
+
+                 if (offsetBytes === 0) throw new Error("Invalid pointer offset 0");
+                 this.pos = this.pos - offsetBytes;
+
+                 // Once resolved, we are at the target.
+                 // The target is a normal Value.
+                 // It is NOT wide (unless it is a slot in a wide array, but pointers point to Values, not slots).
+                 // So we reset wide = false.
+                 this.wide = false;
+
+            } else {
+                break;
+            }
+        }
+    }
+
+    getType() {
+        const b0 = this.buffer[this.pos];
+        const tag = b0 >> 4;
+        switch (tag) {
+            case 0: // Small Int
+            case 1: // Long Int
+                return 'number';
+            case 2: // Float
+                return 'number';
+            case 3: // Special
+                const s = (b0 >> 2) & 3;
+                if (s === 0) return 'null';
+                if (s === 1 || s === 2) return 'boolean';
+                return 'undefined';
+            case 4: return 'string';
+            case 5: return 'binary';
+            case 6: return 'array';
+            case 7: return 'dict';
+            default: return 'unknown';
+        }
+    }
+
+    toJS() {
+        const type = this.getType();
+        if (type === 'null') return null;
+        if (type === 'boolean') return this.asBoolean();
+        if (type === 'number') return this.asNumber();
+        if (type === 'string') return this.asString();
+        if (type === 'binary') return this.asBinary();
+        if (type === 'array') {
+            const arr = this.asArray();
+            const res = [];
+            for (let i = 0; i < arr.length; i++) {
+                res.push(arr.get(i).toJS());
+            }
+            return res;
+        }
+        if (type === 'dict') {
+            const dict = this.asDict();
+            const res = {};
+            for (const key of dict.keys()) {
+                res[key] = dict.get(key).toJS();
+            }
+            return res;
+        }
+        return undefined;
+    }
+
+    asBoolean() {
+        const b0 = this.buffer[this.pos];
+        const tag = b0 >> 4;
+        if (tag === 3) {
+             const s = (b0 >> 2) & 3;
+             if (s === 1) return false;
+             if (s === 2) return true;
+        }
+        throw new Error("Value is not a boolean");
+    }
+
+    asNumber() {
+        const b0 = this.buffer[this.pos];
+        const b1 = this.buffer[this.pos + 1];
+        const tag = b0 >> 4;
+
+        if (tag === 0) { // Small Int
+             const high = b0 & 0x0F;
+             const low = b1;
+             let val = (high << 8) | low;
+             if (val & 0x800) val = val - 0x1000;
+             return val;
+        } else if (tag === 1) { // Long Int
+             const u = (b0 >> 3) & 1;
+             const ccc = b0 & 0x07;
+             const size = ccc + 1;
+             const intPos = this.pos + 1;
+             let val = 0;
+             if (size === 1) {
+                val = this.view.getInt8(intPos);
+                if (u) val = val & 0xFF;
+             } else if (size === 2) {
+                val = this.view.getInt16(intPos, true);
+                if (u) val = val & 0xFFFF;
+             } else if (size === 4) {
+                val = this.view.getInt32(intPos, true);
+                if (u) val = val >>> 0;
+             } else if (size === 8) {
+                val = this.view.getBigInt64(intPos, true);
+                if (u) val = this.view.getBigUint64(intPos, true);
+                if (val <= Number.MAX_SAFE_INTEGER && val >= Number.MIN_SAFE_INTEGER) {
+                    val = Number(val);
+                }
+             }
+             return val;
+        } else if (tag === 2) { // Float
+             const s = (b0 >> 3) & 1;
+             const dataPos = this.pos + 2;
+             if (s === 0) return this.view.getFloat32(dataPos, true);
+             else return this.view.getFloat64(dataPos, true);
+        }
+        throw new Error("Value is not a number");
+    }
+
+    asString() {
+        const b0 = this.buffer[this.pos];
+        const tag = b0 >> 4;
+        if (tag !== 4) throw new Error("Value is not a string");
+        const cccc = b0 & 0x0F;
+        let len = cccc;
+        let dataPos = this.pos + 1;
+        if (cccc === 15) {
+            const { value, length } = readVarInt(this.buffer, dataPos);
+            len = value;
+            dataPos += length;
+        }
+        const bytes = this.buffer.slice(dataPos, dataPos + len);
+        return textDecoder.decode(bytes);
+    }
+
+    asBinary() {
+        const b0 = this.buffer[this.pos];
+        const tag = b0 >> 4;
+        if (tag !== 5) throw new Error("Value is not binary");
+        const cccc = b0 & 0x0F;
+        let len = cccc;
+        let dataPos = this.pos + 1;
+        if (cccc === 15) {
+            const { value, length } = readVarInt(this.buffer, dataPos);
+            len = value;
+            dataPos += length;
+        }
+        return this.buffer.slice(dataPos, dataPos + len);
+    }
+
+    asArray() {
+        if (this.getType() !== 'array') throw new Error("Value is not an array");
+        return new FleeceArray(this.buffer, this.pos, this.view);
+    }
+
+    asDict() {
+        if (this.getType() !== 'dict') throw new Error("Value is not a dict");
+        return new FleeceDict(this.buffer, this.pos, this.view);
+    }
+}
+
+class FleeceArray {
+    constructor(buffer, pos, view) {
+        this.buffer = buffer;
+        this.view = view;
+        this.pos = pos;
+
+        const b0 = this.buffer[pos];
+        const b1 = this.buffer[pos+1];
+        this.wide = (b0 >> 3) & 1;
+        const ccc = ((b0 & 0x07) << 8) | b1;
+
+        this.count = ccc;
+        this.dataPos = pos + 2;
+        if (ccc === 2047) {
+             const { value, length } = readVarInt(buffer, this.dataPos);
+             this.count = value;
+             this.dataPos += length;
+        }
+    }
+
+    get length() {
+        return this.count;
+    }
+
+    get(index) {
+        if (index < 0 || index >= this.count) return undefined;
+        const slotSize = this.wide ? 4 : 2;
+        const slotPos = this.dataPos + (index * slotSize);
+        return new FleeceValue(this.buffer, slotPos, this.view, !!this.wide);
+    }
+
+    *[Symbol.iterator]() {
+        for (let i = 0; i < this.count; i++) {
+            yield this.get(i);
+        }
+    }
+}
+
+class FleeceDict {
+    constructor(buffer, pos, view) {
+        this.buffer = buffer;
+        this.view = view;
+        this.pos = pos;
+
+        const b0 = this.buffer[pos];
+        const b1 = this.buffer[pos+1];
+        this.wide = (b0 >> 3) & 1;
+        const ccc = ((b0 & 0x07) << 8) | b1;
+
+        this.count = ccc;
+        this.dataPos = pos + 2;
+        if (ccc === 2047) {
+             const { value, length } = readVarInt(buffer, this.dataPos);
+             this.count = value;
+             this.dataPos += length;
+        }
+    }
+
+    get length() {
+        return this.count;
+    }
+
+    get(key) {
+        let low = 0;
+        let high = this.count - 1;
+        const slotSize = this.wide ? 4 : 2;
+
+        while (low <= high) {
+            const mid = (low + high) >>> 1;
+            const keySlotPos = this.dataPos + (mid * 2 * slotSize);
+            const keyVal = new FleeceValue(this.buffer, keySlotPos, this.view, !!this.wide);
+            const keyStr = keyVal.asString();
+
+            if (keyStr < key) {
+                low = mid + 1;
+            } else if (keyStr > key) {
+                high = mid - 1;
+            } else {
+                const valSlotPos = keySlotPos + slotSize;
+                return new FleeceValue(this.buffer, valSlotPos, this.view, !!this.wide);
+            }
+        }
+        return undefined;
+    }
+
+    *keys() {
+        const slotSize = this.wide ? 4 : 2;
+        for (let i = 0; i < this.count; i++) {
+            const keySlotPos = this.dataPos + (i * 2 * slotSize);
+            const keyVal = new FleeceValue(this.buffer, keySlotPos, this.view, !!this.wide);
+            yield keyVal.asString();
         }
     }
 }
@@ -232,221 +676,63 @@ class FleeceDecoder {
         this.view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     }
 
-    decode() {
-        // Find root.
-        // Start 2 bytes from end.
-        if (this.buffer.length < 2) return undefined;
+    getRoot() {
+        if (this.buffer.length < 2) return null;
         let pos = this.buffer.length - 2;
 
-        const rootValue = this.readValue(pos);
-        // "If this value is a pointer, dereference it... If *this* value is a pointer..."
-        // `readValue` handles pointer dereferencing recursively?
-        // No, `readValue` reads a value at `pos`.
-        // If `pos` contains a pointer, `readValue` follows it.
-        return rootValue;
+        // Spec: "If this value is a pointer, dereference it (as a narrow pointer).
+        // If *this* value is a pointer, dereference it (as a *wide* pointer)."
+
+        // First resolve (Narrow)
+        const root1 = new FleeceValue(this.buffer, pos, this.view, false);
+
+        // Check if root1 resolved to a Wide Pointer
+        // We need to inspect the byte at root1.pos to see if it is a pointer.
+        // `FleeceValue` constructor already resolved pointers!
+        // So `root1.pos` is the target.
+        // But did `root1` constructor handle the "double dereference"?
+        // `_resolvePointer` loops.
+        // Iteration 1: 2-byte pointer (root slot). Resolves to Target1.
+        // Iteration 2: Check bytes at Target1.
+        // If Target1 is a Wide Pointer (Tag 1xxxxxxx and 4 bytes long).
+        // `_resolvePointer` checks `b0 & 0x80`.
+        // If it is set, it treats it as Narrow Pointer (unless `wide` param is true).
+        // But here `wide` is false.
+        // So it treats Target1 as Narrow Pointer.
+        // This is WRONG if Target1 is actually a Wide Pointer.
+
+        // So `FleeceValue` is not capable of handling this specific Root Logic automatically.
+        // We should handle it manually in `getRoot`.
+
+        // 1. Read root slot manually.
+        let p = pos;
+        let b0 = this.buffer[p];
+        if ((b0 & 0x80) !== 0) {
+            // It is a pointer (Narrow).
+            let b1 = this.buffer[p+1];
+            let o = ((b0 & 0x7F) << 8) | b1;
+            p = p - o * 2;
+
+            // 2. Check if the target is a pointer (Wide).
+            b0 = this.buffer[p];
+            if ((b0 & 0x80) !== 0) {
+                 // It is a pointer. Assume Wide for this second hop.
+                 // Read 4 bytes.
+                 let b1 = this.buffer[p+1];
+                 let b2 = this.buffer[p+2];
+                 let b3 = this.buffer[p+3];
+                 let oWide = ((b0 & 0x7F) << 24) | (b1 << 16) | (b2 << 8) | b3;
+                 p = p - oWide * 2;
+            }
+        }
+
+        return new FleeceValue(this.buffer, p, this.view);
     }
 
-    readValue(pos) {
-        // Read 2 bytes at pos.
-        const b0 = this.buffer[pos];
-        const b1 = this.buffer[pos + 1];
-
-        const tag = b0 >> 4;
-
-        if (tag === 0) {
-            // Small Int
-            // 0000iiii iiiiiiii
-            const high = b0 & 0x0F;
-            const low = b1;
-            let val = (high << 8) | low;
-            // Sign extend 12-bit
-            if (val & 0x800) {
-                val = val - 0x1000;
-            }
-            return val;
-        } else if (tag === 1) {
-            // Long Int
-            // 0001uccc
-            const u = (b0 >> 3) & 1;
-            const ccc = b0 & 0x07;
-            const count = ccc + 1; // bytes of int. Actually `ccc = byte count - 1`.
-            // Wait, spec says "ccc = byte count - 1"?
-            // "0001uccc ... ccc = byte count - 1".
-            // If ccc=0, count=1.
-            // If ccc=7, count=8.
-            const size = ccc + 1; // Wait, my encoder used ccc=0 for 1 byte. Correct.
-
-            // Value is at pos + 2 (after header).
-            // But wait, "Longer strings and integers include a byte count in the 2-byte header".
-            // Wait, Long Int header is 1 byte?
-            // "0001uccc iiiiiiii..."
-            // "0001uccc" is byte 0.
-            // What about byte 1?
-            // "LE integer follows".
-            // Does it follow immediately after byte 0?
-            // "Values ... occupy at least two bytes."
-            // If header is 1 byte and int is 1 byte. Total 2 bytes. Fits.
-            // So int starts at pos + 1.
-
-            const intPos = pos + 1;
-            // Read size bytes from intPos. LE.
-            let val = 0;
-            // Use DataView
-            if (size === 1) {
-                val = this.view.getInt8(intPos);
-                if (u) val = val & 0xFF; // Unsigned? `u` bit.
-            } else if (size === 2) {
-                val = this.view.getInt16(intPos, true);
-                if (u) val = val & 0xFFFF;
-            } else if (size === 4) {
-                val = this.view.getInt32(intPos, true);
-                if (u) val = val >>> 0;
-            } else if (size === 8) {
-                val = this.view.getBigInt64(intPos, true);
-                if (u) val = this.view.getBigUint64(intPos, true);
-                // Convert to Number if safe?
-                if (val <= Number.MAX_SAFE_INTEGER && val >= Number.MIN_SAFE_INTEGER) {
-                    val = Number(val);
-                }
-            }
-            return val;
-
-        } else if (tag === 2) {
-            // Float
-            // 0010sx--
-            const s = (b0 >> 3) & 1;
-            // pos+2 is data.
-            const dataPos = pos + 2;
-            if (s === 0) {
-                return this.view.getFloat32(dataPos, true);
-            } else {
-                return this.view.getFloat64(dataPos, true);
-            }
-        } else if (tag === 3) {
-            // Special
-            // 0011ss--
-            const s = (b0 >> 2) & 3;
-            if (s === 0) return null;
-            if (s === 1) return false;
-            if (s === 2) return true;
-            return undefined;
-        } else if (tag === 4) {
-            // String
-            // 0100cccc
-            const cccc = b0 & 0x0F;
-            let len = cccc;
-            let dataPos = pos + 1;
-            if (cccc === 15) {
-                // Varint follows
-                const { value, length } = this.readVarInt(dataPos);
-                len = value;
-                dataPos += length;
-            }
-            // Read bytes
-            const bytes = this.buffer.slice(dataPos, dataPos + len);
-            return textDecoder.decode(bytes);
-
-        } else if (tag === 5) {
-            // Binary
-            // 0101cccc
-            // Same as string
-            const cccc = b0 & 0x0F;
-            let len = cccc;
-            let dataPos = pos + 1;
-            if (cccc === 15) {
-                const { value, length } = this.readVarInt(dataPos);
-                len = value;
-                dataPos += length;
-            }
-            return this.buffer.slice(dataPos, dataPos + len);
-
-        } else if (tag === 6) {
-            // Array
-            // 0110wccc
-            const w = (b0 >> 3) & 1;
-            const ccc = ((b0 & 0x07) << 8) | b1;
-            let count = ccc;
-            let dataPos = pos + 2;
-            if (ccc === 2047) {
-                const { value, length } = this.readVarInt(dataPos);
-                count = value;
-                dataPos += length;
-            }
-
-            const res = [];
-            for (let i = 0; i < count; i++) {
-                // Read slot.
-                // Narrow array: 2 bytes.
-                // Wide array: 4 bytes.
-                let val;
-                if (w) {
-                    // Wide not supported in encoder, but let's just skip/fail.
-                    throw new Error("Wide array decoding not implemented");
-                } else {
-                    // Recurse?
-                    // The slot *is* a value (maybe a pointer).
-                    // `readValue(dataPos)` will handle it.
-                    // But wait, `readValue` expects `pos` to be the start of the value.
-                    // Yes, the slot contains the value.
-                    val = this.readValue(dataPos);
-                    dataPos += 2;
-                }
-                res.push(val);
-            }
-            return res;
-
-        } else if (tag === 7) {
-            // Dictionary
-            // 0111wccc
-            const w = (b0 >> 3) & 1;
-            const ccc = ((b0 & 0x07) << 8) | b1;
-            let count = ccc;
-            let dataPos = pos + 2;
-            if (ccc === 2047) {
-                const { value, length } = this.readVarInt(dataPos);
-                count = value;
-                dataPos += length;
-            }
-
-            const res = {};
-            for (let i = 0; i < count; i++) {
-                // Key
-                const key = this.readValue(dataPos);
-                dataPos += 2; // narrow
-                // Value
-                const val = this.readValue(dataPos);
-                dataPos += 2; // narrow
-
-                res[key] = val;
-            }
-            return res;
-
-        } else if (tag >= 8) {
-            // Pointer
-            // 1ooooooo oooooooo
-            const o = ((b0 & 0x7F) << 8) | b1;
-            if (o === 0) {
-                 throw new Error("Invalid pointer offset 0");
-            }
-            const offsetBytes = o * 2;
-            const targetPos = pos - offsetBytes;
-            return this.readValue(targetPos);
-        }
-    }
-
-    readVarInt(pos) {
-        let result = 0;
-        let shift = 0;
-        let length = 0;
-        while (true) {
-            const b = this.buffer[pos + length];
-            length++;
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) === 0) break;
-            shift += 7;
-        }
-        return { value: result, length };
+    decode() {
+        const root = this.getRoot();
+        return root ? root.toJS() : undefined;
     }
 }
 
-module.exports = { FleeceEncoder, FleeceDecoder };
+module.exports = { FleeceEncoder, FleeceDecoder, FleeceValue };

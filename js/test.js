@@ -45,4 +45,74 @@ test("Complex Structure", {
     }
 });
 
+function testLazy() {
+    console.log("Testing Lazy Access...");
+
+    const data = {
+        "a": 1,
+        "b": [10, 20, 30],
+        "c": { "x": "hello", "y": "world" }
+    };
+
+    const encoder = new FleeceEncoder();
+    const encoded = encoder.encode(data);
+    const decoder = new FleeceDecoder(encoded);
+    const root = decoder.getRoot();
+
+    // Check Root Type
+    assert.strictEqual(root.getType(), 'dict');
+    const dict = root.asDict();
+
+    // Check Keys
+    const keys = Array.from(dict.keys());
+    assert.deepStrictEqual(keys, ["a", "b", "c"]);
+
+    // Check "a"
+    const valA = dict.get("a");
+    assert.strictEqual(valA.getType(), 'number');
+    assert.strictEqual(valA.asNumber(), 1);
+
+    // Check "b"
+    const valB = dict.get("b");
+    assert.strictEqual(valB.getType(), 'array');
+    const arrB = valB.asArray();
+    assert.strictEqual(arrB.length, 3);
+    assert.strictEqual(arrB.get(0).asNumber(), 10);
+    assert.strictEqual(arrB.get(1).asNumber(), 20);
+    assert.strictEqual(arrB.get(2).asNumber(), 30);
+    assert.strictEqual(arrB.get(3), undefined); // Out of bounds
+
+    // Check "c"
+    const valC = dict.get("c");
+    assert.strictEqual(valC.getType(), 'dict');
+    const dictC = valC.asDict();
+    assert.strictEqual(dictC.get("x").asString(), "hello");
+    assert.strictEqual(dictC.get("y").asString(), "world");
+    assert.strictEqual(dictC.get("z"), undefined); // Missing key
+
+    console.log("PASS: Lazy Access");
+}
+
+function testDeepNested() {
+    console.log("Testing Deep Nested Lazy Access...");
+    const data = { "level1": { "level2": { "level3": [1, 2, 3] } } };
+
+    const encoder = new FleeceEncoder();
+    const encoded = encoder.encode(data);
+    const decoder = new FleeceDecoder(encoded);
+
+    const val = decoder.getRoot()
+        .asDict().get("level1")
+        .asDict().get("level2")
+        .asDict().get("level3")
+        .asArray().get(1)
+        .asNumber();
+
+    assert.strictEqual(val, 2);
+    console.log("PASS: Deep Nested Lazy Access");
+}
+
+testLazy();
+testDeepNested();
+
 console.log("All tests passed!");
